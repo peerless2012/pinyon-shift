@@ -113,15 +113,25 @@ jobs:
           ndk=$(python3 -c "import json; print(json.load(open('config/android-toolchain.json'))['android_sdk']['ndk'])")
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ndk"
           jobs=$(nproc)
-          cmake --preset linux-amd64 -S thirdparty/shiftglue-sdk \
+          sdk=thirdparty/shiftglue-sdk
+          # The SDK's linux presets put the build tree at
+          # ${sourceDir}/out/build/<preset> (linux-base.binaryDir), i.e. inside
+          # the submodule. `cmake --build --preset` resolves binaryDir relative
+          # to the current dir, not the submodule, so it looks in the repo root
+          # and fails. Drive the build by the resolved directory instead, and
+          # locate the rexglue binary afterwards rather than hard-coding a path.
+          cmake --preset linux-amd64 -S "$sdk" \
             -DREXGLUE_ENABLE_TRACY=OFF -DSDL_HIDAPI_LIBUSB=OFF
-          cmake --build --preset linux-amd64-release \
+          builddir="$sdk/out/build/linux-amd64"
+          cmake --build "$builddir" --config Release \
             --target rexglue --parallel "$jobs"
-          rexglue="thirdparty/shiftglue-sdk/out/linux-amd64/Release/rexglue"
-          if [ ! -x "$rexglue" ]; then
-            echo "::error::rexglue was not produced at $rexglue" >&2
+          rexglue=$(find "$sdk/out" -type f -name rexglue -perm -u+x | head -1)
+          if [ -z "$rexglue" ]; then
+            echo "::error::rexglue binary not found under $sdk/out after build" >&2
+            find "$sdk/out" -name 'rexglue*' -print >&2 || true
             exit 1
           fi
+          echo "rexglue: $rexglue"
           "$rexglue" --log-level info codegen config/rexglue/pinyon_shift_manifest.toml
           if [ ! -f .local/generated/default/sources.cmake ]; then
             echo "::error::codegen did not produce .local/generated/default/sources.cmake" >&2
