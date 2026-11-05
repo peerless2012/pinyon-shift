@@ -101,6 +101,20 @@ jobs:
           # sdkmanager and javac in pinyon_android.py need JDK 17 (jdk_major).
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
 
+      # The SDK's host code (e.g. rex/system/map_parser.h) uses C++23
+      # std::expected, which ubuntu-24.04's stock Clang 18 / libstdc++ does not
+      # provide. Install Clang 20 from apt.llvm.org to match the SDK toolchain
+      # (config/release-toolchain.json pins LLVM 20). apt.llvm.org has a noble
+      # (24.04) repository; it has none for 26.04, which is one more reason the
+      # runner stays pinned to 24.04.
+      - name: Install Clang 20 for the host build
+        run: |
+          set -euo pipefail
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 20
+          clang++-20 --version | head -1
+
       # Build the host code generator (rexglue) from the ShiftGlue SDK
       # submodule and translate the game, exactly as tools/build-preview.ps1
       # does on Windows: configure with the SDK's own linux-amd64 preset, build
@@ -120,7 +134,10 @@ jobs:
           # to the current dir, not the submodule, so it looks in the repo root
           # and fails. Drive the build by the resolved directory instead, and
           # locate the rexglue binary afterwards rather than hard-coding a path.
+          # Override the preset's hard-coded clang/clang++ with the Clang 20
+          # installed above, so the C++23 std::expected usage compiles.
           cmake --preset linux-amd64 -S "$sdk" \
+            -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
             -DREXGLUE_ENABLE_TRACY=OFF -DSDL_HIDAPI_LIBUSB=OFF
           builddir="$sdk/out/build/linux-amd64"
           cmake --build "$builddir" --config Release \
