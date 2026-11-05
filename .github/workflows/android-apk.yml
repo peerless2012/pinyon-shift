@@ -84,7 +84,11 @@ jobs:
         run: |
           set -euo pipefail
           packages=$(python3 -c "import json; print(' '.join(json.load(open('config/android-toolchain.json'))['android_sdk']['packages']))")
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install $packages > /dev/null
+          # Accept licenses first (its own invocation), then install. Piping
+          # `yes` into --install breaks under pipefail: sdkmanager closes stdin
+          # early and `yes` dies with SIGPIPE, failing the whole pipeline.
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install $packages > /dev/null
           sudo apt-get install -y ninja-build
           # sdkmanager and javac in pinyon_android.py need JDK 17 (jdk_major).
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
