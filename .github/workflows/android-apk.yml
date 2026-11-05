@@ -2,13 +2,15 @@ name: Android APK
 
 # Fork-maintained Android APK build. Reuses the upstream, Gradle-free Python
 # packaging chain (tools/pinyon.py android build, signed by tools/apk_sign.py)
-# rather than introducing a Gradle project. Fires on every tag so the fork can
-# follow upstream releases, plus a manual trigger for testing. The upstream
+# rather than introducing a Gradle project. Fires only on android-v* tags
+# (e.g. android-v0.8.1), plus a manual trigger for testing. The platform
+# prefix keeps this build from reacting to upstream v* tags that arrive when
+# following upstream, and leaves room for an ohos-v* build later. The upstream
 # tag-triggered release workflow (.github/workflows/release.yml) is disabled to
 # workflow_dispatch only so the two do not race for the same tag/Release.
 on:
   push:
-    tags: ['*']
+    tags: ['android-v*']
   workflow_dispatch:
 
 permissions:
@@ -79,17 +81,23 @@ jobs:
           PY
 
       # Install the pinned Android SDK/NDK/build-tools/platform and Ninja, as
-      # the upstream prebuilt-android job does (.github/workflows/release.yml).
+      # the upstream prebuilt-android job does (.github/workflows/release.yml),
+      # plus the X11/Wayland/audio -dev packages the host-side rexglue build
+      # needs: it compiles the bundled SDL for x86-64, whose ui CMake probes
+      # x11-xcb and fails configuration when the dev packages are absent.
       - name: Install the pinned Android packages and Ninja
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ninja-build \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libx11-xcb-dev libwayland-dev libxkbcommon-dev wayland-protocols
           packages=$(python3 -c "import json; print(' '.join(json.load(open('config/android-toolchain.json'))['android_sdk']['packages']))")
           # Accept licenses first (its own invocation), then install. Piping
           # `yes` into --install breaks under pipefail: sdkmanager closes stdin
           # early and `yes` dies with SIGPIPE, failing the whole pipeline.
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install $packages > /dev/null
-          sudo apt-get install -y ninja-build
           # sdkmanager and javac in pinyon_android.py need JDK 17 (jdk_major).
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
 
@@ -152,18 +160,21 @@ jobs:
           retention-days: 90
 
       # Publish a Release only on a tag push. Create it if new, otherwise add
-      # the APK to the existing Release with --clobber. A tag containing '-'
-      # (e.g. 0.8.1-rc1) is marked prerelease.
+      # the APK to the existing Release with --clobber. The android-v prefix is
+      # stripped first; a pre-release suffix on the version (e.g.
+      # android-v0.8.1-rc1 -> 0.8.1-rc1) marks the Release as a pre-release,
+      # while a plain version (android-v0.8.1 -> 0.8.1) is a full release.
       - name: Publish the Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/android-v')
         env:
           GH_TOKEN: ${{ github.token }}
           APK: ${{ steps.apk.outputs.name }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          version="${TAG#android-v}"
           prerelease=()
-          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          case "$version" in *-*) prerelease=(--prerelease) ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$APK" --clobber
           else
