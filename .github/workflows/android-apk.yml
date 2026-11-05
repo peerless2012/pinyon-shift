@@ -1,0 +1,168 @@
+name: Android APK
+
+# Fork-maintained Android APK build. Reuses the upstream, Gradle-free Python
+# packaging chain (tools/pinyon.py android build, signed by tools/apk_sign.py)
+# rather than introducing a Gradle project. Fires on every tag so the fork can
+# follow upstream releases, plus a manual trigger for testing. The upstream
+# tag-triggered release workflow (.github/workflows/release.yml) is disabled to
+# workflow_dispatch only so the two do not race for the same tag/Release.
+on:
+  push:
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # codegen reads the ShiftGlue SDK submodule and the game inputs; a
+          # full history is not needed, but the submodule is.
+          submodules: recursive
+
+      # The game executables live in a private repo (not in this fork), fetched
+      # with a PAT stored as the XEX_REPO_TOKEN secret. A fork does not inherit
+      # secrets, so fail early and clearly when it is empty.
+      - name: Fetch the game executables
+        env:
+          XEX_REPO_TOKEN: ${{ secrets.XEX_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${XEX_REPO_TOKEN:-}" ]; then
+            echo "::error::The XEX_REPO_TOKEN secret is not set. It must hold a token that can read peerless2012/Forza1files. Forks do not inherit secrets; add it under Settings > Secrets and variables > Actions." >&2
+            exit 1
+          fi
+          mkdir -p .local/game/base
+          # The names and layout come from config/supported-dumps.json; the
+          # files sit on the private repo's default branch (master) as plain
+          # files, read as raw bytes through the contents API.
+          names=$(python3 -c "import json; print('\n'.join(e['guest_path'] for e in json.load(open('config/supported-dumps.json'))['dumps'][0]['executables']))")
+          while IFS= read -r name; do
+            echo "Fetching $name"
+            curl -sfL \
+              -H "Authorization: token $XEX_REPO_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              -o ".local/game/base/$name" \
+              "https://api.github.com/repos/peerless2012/Forza1files/contents/$name?ref=master"
+          done <<< "$names"
+
+      # Reject anything that is not the exact supported dump before spending an
+      # NDK build on it (config/supported-dumps.json, size + sha256).
+      - name: Verify the game executables
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib, sys
+          dumps = json.load(open("config/supported-dumps.json"))
+          base = pathlib.Path(".local/game/base")
+          failed = False
+          for entry in dumps["dumps"][0]["executables"]:
+              path = base / entry["guest_path"]
+              if not path.is_file():
+                  print(f"missing: {path}", file=sys.stderr); failed = True; continue
+              size = path.stat().st_size
+              if size != entry["size_bytes"]:
+                  print(f"size mismatch for {path.name}: got {size}, want {entry['size_bytes']}", file=sys.stderr)
+                  failed = True
+              digest = hashlib.sha256(path.read_bytes()).hexdigest().upper()
+              if digest != entry["sha256"].upper():
+                  print(f"sha256 mismatch for {path.name}: got {digest}, want {entry['sha256'].upper()}", file=sys.stderr)
+                  failed = True
+              else:
+                  print(f"verified {path.name} ({size} bytes)")
+          sys.exit(1 if failed else 0)
+          PY
+
+      # Install the pinned Android SDK/NDK/build-tools/platform and Ninja, as
+      # the upstream prebuilt-android job does (.github/workflows/release.yml).
+      - name: Install the pinned Android packages and Ninja
+        run: |
+          set -euo pipefail
+          packages=$(python3 -c "import json; print(' '.join(json.load(open('config/android-toolchain.json'))['android_sdk']['packages']))")
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install $packages > /dev/null
+          sudo apt-get install -y ninja-build
+          # sdkmanager and javac in pinyon_android.py need JDK 17 (jdk_major).
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+
+      # Build the host code generator (rexglue) from the ShiftGlue SDK
+      # submodule and translate the game, exactly as tools/build-preview.ps1
+      # does on Windows: configure with the SDK's own linux-amd64 preset, build
+      # the rexglue target, then run its codegen on the pinned manifest. This
+      # writes .local/generated/default/sources.cmake, which the APK build
+      # requires.
+      - name: Build rexglue and generate the game code
+        run: |
+          set -euo pipefail
+          ndk=$(python3 -c "import json; print(json.load(open('config/android-toolchain.json'))['android_sdk']['ndk'])")
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ndk"
+          jobs=$(nproc)
+          cmake --preset linux-amd64 -S thirdparty/shiftglue-sdk \
+            -DREXGLUE_ENABLE_TRACY=OFF -DSDL_HIDAPI_LIBUSB=OFF
+          cmake --build --preset linux-amd64-release \
+            --target rexglue --parallel "$jobs"
+          rexglue="thirdparty/shiftglue-sdk/out/linux-amd64/Release/rexglue"
+          if [ ! -x "$rexglue" ]; then
+            echo "::error::rexglue was not produced at $rexglue" >&2
+            exit 1
+          fi
+          "$rexglue" --log-level info codegen config/rexglue/pinyon_shift_manifest.toml
+          if [ ! -f .local/generated/default/sources.cmake ]; then
+            echo "::error::codegen did not produce .local/generated/default/sources.cmake" >&2
+            exit 1
+          fi
+
+      # Cross-compile and package the APK. pinyon.py android build cross-builds
+      # libmain.so and the facades with the NDK, then package() in
+      # tools/pinyon_android.py aligns and signs it with the pure-Python
+      # apk_sign.py (no Gradle, apksigner, zipalign or keytool) and also
+      # enforces the 16 KiB ELF load-segment alignment, so no extra alignment
+      # check is added here. The product is .local/android/pinyon-shift.apk.
+      - name: Build and package the APK
+        run: |
+          set -euo pipefail
+          ndk=$(python3 -c "import json; print(json.load(open('config/android-toolchain.json'))['android_sdk']['ndk'])")
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ndk"
+          python3 tools/pinyon.py android build --jobs "$(nproc)"
+          test -f .local/android/pinyon-shift.apk
+
+      # Name the uploaded/released artifact with the tag when there is one.
+      - name: Name the APK
+        id: apk
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME:-manual}"
+          safe=$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '-')
+          name="pinyon-shift-${safe}.apk"
+          cp .local/android/pinyon-shift.apk "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pinyon-shift-apk
+          path: ${{ steps.apk.outputs.name }}
+          retention-days: 90
+
+      # Publish a Release only on a tag push. Create it if new, otherwise add
+      # the APK to the existing Release with --clobber. A tag containing '-'
+      # (e.g. 0.8.1-rc1) is marked prerelease.
+      - name: Publish the Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK: ${{ steps.apk.outputs.name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease=()
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" \
+              --title "$TAG" --generate-notes "${prerelease[@]}"
+          fi

@@ -1,8 +1,10 @@
 name: Launcher release
 
+# Fork change: the tag trigger is disabled so this upstream launcher release
+# does not race the fork's Android APK workflow (.github/workflows/android-apk.yml)
+# for the same tag and Release. Left as workflow_dispatch so the file and its
+# jobs stay intact for the smallest possible conflict when merging upstream.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
