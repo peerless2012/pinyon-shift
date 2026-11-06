@@ -1,0 +1,193 @@
+name: Windows build
+
+# Fork-maintained Windows build that translates and compiles the game in CI,
+# so a player never needs the C++ toolchain, the code generator or a local
+# build. Mirrors android-apk.yml: the game executables come from the same
+# private repository, the translation runs on the runner, and the compiled
+# game is published as an artifact (and a Release on a tag).
+#
+# One job per CPU baseline, run in parallel:
+#   sse4.1  runs on any x86-64 CPU
+#   fma     faster, needs FMA3 (Intel Haswell / AMD Zen and later)
+# Both produce the same results (tools/release-common.ps1,
+# Select-PinyonCpuBaseline). The baseline is always fixed here: 'auto' would
+# follow the runner's CPU and could produce a build that crashes on an older
+# player CPU.
+#
+# Fires only on windows-v* tags (e.g. windows-v0.8.1), plus a manual trigger
+# for testing, so it never reacts to upstream v* tags or android-v* tags.
+on:
+  push:
+    tags: ['windows-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline: [sse4.1, fma]
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      # Build the code generator and runtime from the ShiftGlue submodule
+      # instead of looking for a prebuilt kit (none is pinned in this fork).
+      PINYON_SHIFT_SOURCE_SDK: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # The game executables live in a private repo (not in this fork),
+      # fetched with a PAT stored as the XEX_REPO_TOKEN secret. A fork does
+      # not inherit secrets, so fail early and clearly when it is empty.
+      - name: Fetch the game executables
+        shell: pwsh
+        env:
+          XEX_REPO_TOKEN: ${{ secrets.XEX_REPO_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrEmpty($env:XEX_REPO_TOKEN)) {
+            Write-Host "::error::The XEX_REPO_TOKEN secret is not set. It must hold a token that can read peerless2012/Forza1files. Forks do not inherit secrets; add it under Settings > Secrets and variables > Actions."
+            exit 1
+          }
+          $dump = (Get-Content config/supported-dumps.json -Raw | ConvertFrom-Json).dumps[0]
+          $base = '.local/game/base'
+          New-Item -ItemType Directory -Force -Path $base | Out-Null
+          $headers = @{
+            Authorization = "token $env:XEX_REPO_TOKEN"
+            Accept        = 'application/vnd.github.raw'
+          }
+          foreach ($entry in $dump.executables) {
+            $name = $entry.guest_path
+            Write-Host "Fetching $name"
+            Invoke-WebRequest -Headers $headers -OutFile "$base/$name" `
+              -Uri "https://api.github.com/repos/peerless2012/Forza1files/contents/${name}?ref=master"
+          }
+
+      # Reject anything that is not the exact supported dump before spending
+      # a full build on it (config/supported-dumps.json, size + sha256).
+      - name: Verify the game executables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dump = (Get-Content config/supported-dumps.json -Raw | ConvertFrom-Json).dumps[0]
+          $failed = $false
+          foreach ($entry in $dump.executables) {
+            $path = ".local/game/base/$($entry.guest_path)"
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              Write-Host "::error::missing: $path"; $failed = $true; continue
+            }
+            $size = (Get-Item -LiteralPath $path).Length
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            if ($size -ne [int64]$entry.size_bytes) {
+              Write-Host "::error::size mismatch for $($entry.guest_path): got $size, want $($entry.size_bytes)"; $failed = $true
+            } elseif ($hash -ne $entry.sha256.ToUpperInvariant()) {
+              Write-Host "::error::sha256 mismatch for $($entry.guest_path): got $hash"; $failed = $true
+            } else {
+              Write-Host "verified $($entry.guest_path) ($size bytes)"
+            }
+          }
+          if ($failed) { exit 1 }
+
+      # The same preparation the upstream prebuilt-windows job runs before it
+      # builds: the ShiftGlue SDK and the pinned toolchain (LLVM, CMake,
+      # Ninja, Python). Visual Studio is already on the runner.
+      - name: Prepare ShiftGlue and the toolchain
+        shell: powershell
+        run: |
+          ./tools/prepare-rexglue.ps1
+          ./tools/provision-toolchain.ps1
+
+      # tools/build-preview.ps1 is the whole player-side build: it builds the
+      # code generator, translates the game and compiles pinyon_shift.exe,
+      # then writes .local/build.json and pinyon_shift_build.json beside the
+      # executable. Run unchanged so the build is the one a player would get.
+      - name: Translate and compile the game
+        shell: powershell
+        run: |
+          . ./tools/release-common.ps1
+          $environment = Enter-PinyonBuildEnvironment
+          $env:PATH = "$(Split-Path $environment.Ninja);$env:PATH"
+          ./tools/build-preview.ps1 -CpuBaseline '${{ matrix.baseline }}'
+
+      # Keep the runtime, drop the build tree's intermediates. The file list
+      # is printed so the packaged contents are visible in the log.
+      - name: Stage the runtime files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = 'out/build/win-amd64-release'
+          $stage = '.artifacts/runtime'
+          if (-not (Test-Path "$source/pinyon_shift.exe")) { throw 'pinyon_shift.exe was not produced.' }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          robocopy $source $stage /E /NFL /NDL /NJH /NJS /NP `
+            /XD CMakeFiles .cmake _deps `
+            /XF *.obj *.o *.a *.lib *.exp *.ilk *.pdb *.ninja .ninja_deps .ninja_log CMakeCache.txt cmake_install.cmake
+          # robocopy exits 0-7 on success.
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
+          $global:LASTEXITCODE = 0
+          Copy-Item .local/build.json "$stage/build.json"
+          $files = Get-ChildItem $stage -Recurse -File
+          $files | ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.FullName.Substring((Resolve-Path $stage).Path.Length + 1) } |
+            Sort-Object -Descending | Select-Object -First 40
+          '{0:N0} files, {1:N1} MB' -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Name and compress the build
+        id: pack
+        shell: pwsh
+        run: |
+          $ref = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { 'manual' }
+          $safe = $ref -replace '[^A-Za-z0-9._-]', '-'
+          $baseline = '${{ matrix.baseline }}' -replace '\.', ''
+          $name = "pinyon-shift-windows-$baseline-$safe.zip"
+          Compress-Archive -Path '.artifacts/runtime/*' -DestinationPath $name -CompressionLevel Optimal
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pinyon-shift-windows-${{ matrix.baseline }}
+          path: ${{ steps.pack.outputs.name }}
+          retention-days: 90
+
+      # The build and codegen logs are the first thing needed when a CI run
+      # fails on a toolchain or translation problem.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: windows-build-logs-${{ matrix.baseline }}
+          path: .local/logs/
+          if-no-files-found: ignore
+
+  # Publish both baselines together on a tag push. Create the Release if new,
+  # otherwise add to it with --clobber. The windows-v prefix is stripped; a
+  # pre-release suffix on the version marks the Release as a pre-release.
+  release:
+    if: startsWith(github.ref, 'refs/tags/windows-v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: pinyon-shift-windows-*
+          path: assets
+          merge-multiple: true
+      - name: Publish the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#windows-v}"
+          prerelease=()
+          case "$version" in *-*) prerelease=(--prerelease) ;; esac
+          ls -l assets
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" assets/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" assets/*.zip --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --generate-notes "${prerelease[@]}"
+          fi
